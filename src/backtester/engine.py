@@ -2,7 +2,7 @@
 # Core backtesting loop and performance analytics.
 
 import pandas as pd
-# from src.core import indicators, trading_logic, trade # Adjust import path
+from src.core import indicators, trading_logic, trade # Adjust import path
 
 class BacktestEngine:
     def __init__(self, data_df, initial_equity=100000):
