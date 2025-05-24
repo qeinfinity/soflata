@@ -1,0 +1,42 @@
+# Python
+__pycache__/
+*.py[cod]
+*.class
+
+# Virtual environment
+venv/
+.venv/
+ENV/
+env/
+env.bak/
+venv.bak/
+
+# IDE / Editor specific
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Data files (if large or sensitive - adjust as needed)
+# data/*.csv
+# data/*.parquet
+
+# Secrets / Config (if not committed)
+# src/config/secrets.ini
+# .env
+
+# Build artifacts
+dist/
+build/
+*.egg-info/
+
+# Notebook checkpoints
+.ipynb_checkpoints
+
+# Test artifacts
+.pytest_cache/
+.coverage
+htmlcov/
+nosetests.xml
+coverage.xml
+*.cover

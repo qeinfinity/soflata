@@ -1,0 +1,13 @@
+pandas>=2.2
+numpy>=2.0
+sqlalchemy>=2.0
+requests
+websocket-client
+python-binance # For Binance API access
+# For plotting/visualization during research/analysis:
+matplotlib
+mplfinance
+# For testing (unittest is built-in, pytest is a popular alternative)
+pytest
+# For PostgreSQL database interaction, if chosen later:
+# psycopg2-binary
