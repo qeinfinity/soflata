@@ -1,7 +1,22 @@
 # VolDelta-MR: src/core/trading_logic.py
 # Contains functions for entry signals, position sizing, stop management, and exits.
-
 import pandas as pd
+import numpy as np # For np.nan if needed
+
+# Constants from PRD (or could be passed in/configured)
+DEFAULT_FALLBACK_SPREAD_PERCENTAGE = 0.05 
+SLIPPAGE_FIXED_PERCENTAGE = 0.02
+
+
+def calculate_slippage_amount_per_unit(exit_price, spread_percentage=DEFAULT_FALLBACK_SPREAD_PERCENTAGE, fixed_percentage=SLIPPAGE_FIXED_PERCENTAGE):
+    """Calculates slippage amount per unit of asset based on PRD 3.6."""
+    # Slippage per execution = max(0.02% * execution_price, 0.5 * simulated_bid_ask_spread)
+    # simulated_bid_ask_spread = execution_price * spread_percentage / 100
+    
+    slip_fixed = (fixed_percentage / 100) * exit_price
+    slip_spread_component = 0.5 * (spread_percentage / 100) * exit_price
+    
+    return max(slip_fixed, slip_spread_component)
 
 # Placeholder for check_entry_signal
 # In src/core/trading_logic.py
@@ -96,7 +111,254 @@ def calculate_position_size_for_tranche(account_equity, tranche_risk_fraction,
     return position_size_units
 
 
-# Placeholder for update_trade_status_per_bar
+
+def update_trade_status_per_bar(current_trade, bar_data): # Removed account_equity_tracker, P&L will be returned
+    if not current_trade['active']:
+        return current_trade, [], 0.0 # current_trade, actions, pnl_for_this_bar
+
+    trade_actions = []
+    pnl_for_this_bar = 0.0
+    
+    direction = current_trade['direction']
+    entry_price = current_trade['entry_price'] # Overall entry price for the trade
+    initial_sigma0 = current_trade['initial_sigma0'] # For invalidation stop
+
+    # Unpack current bar data for easier access
+    bar_high = bar_data['high']
+    bar_low = bar_data['low']
+    bar_close = bar_data['close'] # Used for timeout exits and some stop calculations
+    current_vwap = bar_data['session_vwap']
+    current_sigma = bar_data['session_stdev']
+    current_zscore = bar_data['volume_delta_zscore']
+    current_atr = bar_data['atr_20_30m']
+
+    # --- Helper for closing portions of a trade ---
+    def close_portion(tranche_label, amount_to_close, exit_price_actual, reason):
+        nonlocal pnl_for_this_bar # Allow modification of outer scope variable
+        
+        size_key_current = f"{tranche_label}_current_size"
+        size_key_entry = f"{tranche_label}_entry_size" # Needed if P&L is per-tranche entry avg
+        status_key = f"{tranche_label}_status"
+        
+        if current_trade[size_key_current] <= 0: # Already closed or no size
+            return
+
+        actual_amount_closed = min(amount_to_close, current_trade[size_key_current])
+        if actual_amount_closed <= 0: return
+
+        # Apply Slippage
+        slippage_per_unit = calculate_slippage_amount_per_unit(exit_price_actual)
+        
+        effective_exit_price = 0
+        if direction == 'SHORT': # Selling to close short
+            effective_exit_price = exit_price_actual + slippage_per_unit # We buy back higher (worse price)
+        else: # LONG, selling to close long
+            effective_exit_price = exit_price_actual - slippage_per_unit # We sell lower (worse price)
+
+        # Calculate P&L for this portion
+        portion_pnl = 0
+        if direction == 'SHORT':
+            portion_pnl = (entry_price - effective_exit_price) * actual_amount_closed
+        else: # LONG
+            portion_pnl = (effective_exit_price - entry_price) * actual_amount_closed
+        
+        pnl_for_this_bar += portion_pnl
+        current_trade['pnl'] += portion_pnl # Update total P&L for the trade object
+        current_trade[size_key_current] -= actual_amount_closed
+        
+        action_detail = f"{tranche_label}_{reason} @ {exit_price_actual:.2f} (eff: {effective_exit_price:.2f}), Closed: {actual_amount_closed:.4f}, PnL: {portion_pnl:.2f}"
+        trade_actions.append(action_detail)
+        current_trade['log'].append(f"{bar_data.name}: {action_detail}")
+
+
+        if current_trade[size_key_current] <= 0.0000001: # Effectively zero, handle float precision
+            current_trade[size_key_current] = 0
+            current_trade[status_key] = 'CLOSED'
+            trade_actions.append(f"{tranche_label}_FULLY_CLOSED")
+            current_trade['log'].append(f"{bar_data.name}: {tranche_label}_FULLY_CLOSED")
+
+
+    # --- I. Check for Stop-Loss Hits ---
+    if current_trade['t1_status'] == 'OPEN':
+        stop_price_t1 = current_trade['t1_stop_price']
+        if (direction == 'SHORT' and bar_high >= stop_price_t1) or \
+           (direction == 'LONG' and bar_low <= stop_price_t1):
+            close_portion('t1', current_trade['t1_current_size'], stop_price_t1, "STOPPED_OUT")
+            
+    if current_trade['t2_status'] != 'CLOSED' and current_trade['t2_current_size'] > 0 : # Check if T2 is active
+        stop_price_t2 = current_trade['t2_stop_price']
+        if (direction == 'SHORT' and bar_high >= stop_price_t2) or \
+           (direction == 'LONG' and bar_low <= stop_price_t2):
+            close_portion('t2', current_trade['t2_current_size'], stop_price_t2, "STOPPED_OUT")
+
+    if (current_trade['t1_status'] == 'CLOSED' or current_trade['t1_current_size'] == 0) and \
+       (current_trade['t2_status'] == 'CLOSED' or current_trade['t2_current_size'] == 0):
+        current_trade['active'] = False
+        return current_trade, trade_actions, pnl_for_this_bar
+
+    # --- II. Check Invalidation Rule (PRD 3.3) ---
+    if not current_trade.get('vwap_1sigma_target_hit_for_t1', False):
+        z_flipped = (direction == 'SHORT' and current_zscore < 0) or \
+                    (direction == 'LONG' and current_zscore > 0)
+        if z_flipped:
+            invalidation_stop_price = entry_price + (0.1 * initial_sigma0) if direction == 'SHORT' else entry_price - (0.1 * initial_sigma0)
+            action_msg = f"INVALIDATION_Z_FLIP_STOPS_MOVED_TO_{invalidation_stop_price:.2f}"
+            trade_actions.append(action_msg)
+            current_trade['log'].append(f"{bar_data.name}: {action_msg}")
+
+            if current_trade['t1_status'] == 'OPEN':
+                current_trade['t1_stop_price'] = max(invalidation_stop_price, current_trade['t1_stop_price']) if direction == 'SHORT' else min(invalidation_stop_price, current_trade['t1_stop_price'])
+            if current_trade['t2_status'] != 'CLOSED' and current_trade['t2_current_size'] > 0:
+                current_trade['t2_stop_price'] = max(invalidation_stop_price, current_trade['t2_stop_price']) if direction == 'SHORT' else min(invalidation_stop_price, current_trade['t2_stop_price'])
+            
+            # Re-check stops with new invalidation prices for *this current bar*
+            # This is important as invalidation might trigger an immediate exit.
+            if current_trade['t1_status'] == 'OPEN':
+                stop_price_t1_inv = current_trade['t1_stop_price']
+                if (direction == 'SHORT' and bar_high >= stop_price_t1_inv) or \
+                   (direction == 'LONG' and bar_low <= stop_price_t1_inv):
+                    close_portion('t1', current_trade['t1_current_size'], stop_price_t1_inv, "STOPPED_OUT_POST_INVALIDATION")
+
+            if current_trade['t2_status'] != 'CLOSED' and current_trade['t2_current_size'] > 0:
+                stop_price_t2_inv = current_trade['t2_stop_price']
+                if (direction == 'SHORT' and bar_high >= stop_price_t2_inv) or \
+                   (direction == 'LONG' and bar_low <= stop_price_t2_inv):
+                    close_portion('t2', current_trade['t2_current_size'], stop_price_t2_inv, "STOPPED_OUT_POST_INVALIDATION")
+            
+            if (current_trade['t1_status'] == 'CLOSED' or current_trade['t1_current_size'] == 0) and \
+               (current_trade['t2_status'] == 'CLOSED' or current_trade['t2_current_size'] == 0):
+                current_trade['active'] = False
+                return current_trade, trade_actions, pnl_for_this_bar
+
+
+    # --- III. Check Scale-Out & Profit-Taking Exits (PRD 3.4) ---
+    # Target 1: Price reaches current VWAP ± 1σ
+    target_1sigma_price = current_vwap - current_sigma if direction == 'SHORT' else current_vwap + current_sigma
+    if not current_trade.get('scaled_out_t2_50_pct', False) and current_trade['t2_current_size'] > 0:
+        if (direction == 'SHORT' and bar_low <= target_1sigma_price) or \
+           (direction == 'LONG' and bar_high >= target_1sigma_price):
+            amount_to_close_t2 = current_trade['t2_entry_size'] * 0.50
+            close_portion('t2', amount_to_close_t2, target_1sigma_price, "SCALED_OUT_50PCT")
+            current_trade['scaled_out_t2_50_pct'] = True
+            current_trade['vwap_1sigma_target_hit_for_t1'] = True # Mark objective met
+
+            # Trail REMAINING T2
+            new_t2_stop = current_vwap + (1.5 * current_sigma) if direction == 'SHORT' else current_vwap - (1.5 * current_sigma)
+            current_trade['t2_stop_price'] = max(new_t2_stop, current_trade['t2_stop_price']) if direction == 'SHORT' else min(new_t2_stop, current_trade['t2_stop_price'])
+            action_msg = f"T2_STOP_TRAILED_POST_SCALE1_TO_{current_trade['t2_stop_price']:.2f}"
+            trade_actions.append(action_msg)
+            current_trade['log'].append(f"{bar_data.name}: {action_msg}")
+
+
+    # Target 2: Price touches current VWAP
+    if (direction == 'SHORT' and bar_low <= current_vwap) or \
+       (direction == 'LONG' and bar_high >= current_vwap):
+        if current_trade['t1_status'] == 'OPEN' and current_trade['t1_current_size'] > 0:
+            close_portion('t1', current_trade['t1_current_size'], current_vwap, "CLOSED_AT_VWAP")
+            current_trade['vwap_1sigma_target_hit_for_t1'] = True 
+
+        if not current_trade.get('scaled_out_t2_next_25_pct', False) and current_trade['t2_current_size'] > 0:
+            amount_to_close_t2_further = current_trade['t2_entry_size'] * 0.25
+            close_portion('t2', amount_to_close_t2_further, current_vwap, "SCALED_OUT_FURTHER_25PCT_AT_VWAP")
+            current_trade['scaled_out_t2_next_25_pct'] = True
+            
+    # Target 3: Price overshoots VWAP by –0.5σ (short) / +0.5σ (long)
+    if current_trade['t2_current_size'] > 0:
+        overshoot_target_price = current_vwap - (0.5 * current_sigma) if direction == 'SHORT' else current_vwap + (0.5 * current_sigma)
+        new_trail_stop_t2_overshoot = np.nan # Initialize
+        
+        if (direction == 'SHORT' and bar_low <= overshoot_target_price):
+            stop_anchor1 = current_vwap 
+            stop_anchor2 = bar_close + current_sigma # Using bar's close as "price"
+            new_trail_stop_t2_overshoot = max(stop_anchor1, stop_anchor2)
+            current_trade['t2_stop_price'] = max(new_trail_stop_t2_overshoot, current_trade['t2_stop_price']) # Moves down for short
+
+        elif (direction == 'LONG' and bar_high >= overshoot_target_price):
+            stop_anchor1 = current_vwap
+            stop_anchor2 = bar_close - current_sigma
+            new_trail_stop_t2_overshoot = min(stop_anchor1, stop_anchor2)
+            current_trade['t2_stop_price'] = min(new_trail_stop_t2_overshoot, current_trade['t2_stop_price']) # Moves up for long
+        
+        if not pd.isna(new_trail_stop_t2_overshoot) and new_trail_stop_t2_overshoot != current_trade['t2_stop_price']: # Check if updated
+            action_msg = f"T2_RESIDUAL_TRAILED_OVERSHOOT_TO_{current_trade['t2_stop_price']:.2f}"
+            trade_actions.append(action_msg)
+            current_trade['log'].append(f"{bar_data.name}: {action_msg}")
+
+
+    # --- IV. Dynamic Trailing Stop Logic (PRD 3.3) ---
+    current_trade['bars_held'] = current_trade.get('bars_held', 0) + 1 # Increment bars_held *before* trailing for this bar
+
+    # For T1 (if still open):
+    if current_trade['t1_status'] == 'OPEN':
+        new_t1_anchor_stop = entry_price + (0.25 * current_sigma) if direction == 'SHORT' else entry_price - (0.25 * current_sigma)
+        potential_t1_stop = min(current_trade['t1_stop_price'], new_t1_anchor_stop) if direction == 'SHORT' else max(current_trade['t1_stop_price'], new_t1_anchor_stop)
+        
+        min_stop_dist_t1 = 0.25 * current_atr
+        final_t1_stop = potential_t1_stop
+        if direction == 'SHORT':
+            if (potential_t1_stop - bar_close) < min_stop_dist_t1 :
+                final_t1_stop = bar_close + min_stop_dist_t1
+                final_t1_stop = min(final_t1_stop, current_trade['t1_stop_price']) 
+        else: 
+            if (bar_close - potential_t1_stop) < min_stop_dist_t1:
+                final_t1_stop = bar_close - min_stop_dist_t1
+                final_t1_stop = max(final_t1_stop, current_trade['t1_stop_price'])
+
+        if abs(final_t1_stop - current_trade['t1_stop_price']) > 1e-6 : # Check for meaningful change
+             action_msg = f"T1_STOP_TRAILED_TO_{final_t1_stop:.2f}"
+             trade_actions.append(action_msg)
+             current_trade['log'].append(f"{bar_data.name}: {action_msg}")
+             current_trade['t1_stop_price'] = final_t1_stop
+
+    # For T2 (if still has size and not under a specific scale-out trail)
+    # Logic for T2 trail based on VWAP_t + 3sigma_t unless overridden by scale-out rules
+    # This condition should be more specific, e.g., only if no scale-out has occurred yet,
+    # or if current t2 stop is still based on the initial 3sigma rule.
+    # The scale-out rules above already set specific trails. This is general trailing.
+    if current_trade['t2_current_size'] > 0 and not current_trade.get('scaled_out_t2_50_pct', False): 
+        new_t2_anchor_stop = current_vwap + (3.0 * current_sigma) if direction == 'SHORT' else current_vwap - (3.0 * current_sigma)
+        potential_t2_stop = min(current_trade['t2_stop_price'], new_t2_anchor_stop) if direction == 'SHORT' else max(current_trade['t2_stop_price'], new_t2_anchor_stop)
+
+        min_stop_dist_t2 = 0.25 * current_atr
+        final_t2_stop = potential_t2_stop
+        if direction == 'SHORT':
+            if (potential_t2_stop - bar_close) < min_stop_dist_t2 :
+                final_t2_stop = bar_close + min_stop_dist_t2
+                final_t2_stop = min(final_t2_stop, current_trade['t2_stop_price'])
+        else: 
+            if (bar_close - potential_t2_stop) < min_stop_dist_t2:
+                final_t2_stop = bar_close - min_stop_dist_t2
+                final_t2_stop = max(final_t2_stop, current_trade['t2_stop_price'])
+        
+        if abs(final_t2_stop - current_trade['t2_stop_price']) > 1e-6:
+            action_msg = f"T2_MAIN_STOP_TRAILED_TO_{final_t2_stop:.2f}"
+            trade_actions.append(action_msg)
+            current_trade['log'].append(f"{bar_data.name}: {action_msg}")
+            current_trade['t2_stop_price'] = final_t2_stop
+            
+    # --- V. Check Time-Out Exit (PRD 3.4) ---
+    # bars_held was incremented before trailing for this bar.
+    if current_trade['bars_held'] >= 16: # 8 hours = 16 x 30-min bars (PRD: "Time-out 8 hours (16 x 30m bars)")
+        if current_trade['t1_current_size'] > 0:
+            close_portion('t1', current_trade['t1_current_size'], bar_close, "TIMEOUT_EXIT")
+        if current_trade['t2_current_size'] > 0:
+            close_portion('t2', current_trade['t2_current_size'], bar_close, "TIMEOUT_EXIT")
+        current_trade['active'] = False 
+    
+    # Final check if trade is now fully closed from any of above actions
+    if (current_trade['t1_status'] == 'CLOSED' or current_trade['t1_current_size'] == 0) and \
+       (current_trade['t2_status'] == 'CLOSED' or current_trade['t2_current_size'] == 0):
+        current_trade['active'] = False
+            
+    return current_trade, trade_actions, pnl_for_this_bar
+
+
+if __name__ == '__main__':
+    print("Testing trading logic functions (placeholders)...")
+    # Add simple test calls here if desired
+
+
+"""
 def update_trade_status_per_bar(current_trade, bar_data, account_equity_tracker): # bar_data is current 30-min bar from df_master_30min
     if not current_trade['active']:
         return current_trade, [] # No active trade, no actions
@@ -338,8 +600,4 @@ def update_trade_status_per_bar(current_trade, bar_data, account_equity_tracker)
         current_trade['active'] = False
         
     return current_trade, trade_actions
-
-
-if __name__ == '__main__':
-    print("Testing trading logic functions (placeholders)...")
-    # Add simple test calls here if desired
+"""

@@ -9,48 +9,61 @@ import numpy as np
 import pandas as pd
 import numpy as np
 
-def calculate_volume_delta_zscore(df_1min_data, ticks_win=60, sig_len=7, cmp_len=14, z_len=100):
-    # Ensure 'hlc3' exists or calculate it
+import pandas as pd
+import numpy as np
+
+def calculate_volume_delta_zscore(df_1min_data_input, ticks_win=60, sig_len=7, cmp_len=14, z_len=100):
+    # Work on a copy to avoid SettingWithCopyWarning on the input DataFrame
+    df_1min_data = df_1min_data_input.copy()
+
     if 'hlc3' not in df_1min_data.columns:
         df_1min_data['hlc3'] = (df_1min_data['high'] + df_1min_data['low'] + df_1min_data['close']) / 3
 
-    # Step 1: Raw Momentum Slices
     df_1min_data['momentary_delta'] = (df_1min_data['hlc3'] - df_1min_data['hlc3'].shift(1)) * df_1min_data['volume']
-    df_1min_data['momentary_delta'].iloc[0] = 0 # Handle first NaN
+    
+    # FIX for Pandas Warning: Use .loc for assignment
+    if not df_1min_data.empty: # Ensure DataFrame is not empty before accessing iloc[0]
+        df_1min_data.loc[df_1min_data.index[0], 'momentary_delta'] = 0 # Assign to the first row directly
 
-    # Step 2: Rolling Momentum Sum
-    df_1min_data['roll'] = df_1min_data['momentary_delta'].rolling(window=ticks_win, min_periods=1).sum() # min_periods=1 to get values earlier
+    # ... rest of the function remains the same ...
+    df_1min_data['roll'] = df_1min_data['momentary_delta'].rolling(window=ticks_win, min_periods=1).sum()
 
-    # Step 3: Resample to 30-Min Bars & Sample "roll"
-    # Ensure timestamp is index and datetime object
     if not isinstance(df_1min_data.index, pd.DatetimeIndex):
-        df_1min_data['timestamp'] = pd.to_datetime(df_1min_data['timestamp'])
-        df_1min_data.set_index('timestamp', inplace=True)
+        if 'timestamp' in df_1min_data.columns:
+             df_1min_data['timestamp'] = pd.to_datetime(df_1min_data['timestamp'])
+             df_1min_data.set_index('timestamp', inplace=True)
+        else: # Attempt to convert index if it's not datetime but also not 'timestamp' column
+             try:
+                df_1min_data.index = pd.to_datetime(df_1min_data.index)
+             except Exception as e:
+                print(f"[ERROR] Could not convert index to DatetimeIndex in Z-score calc: {e}")
+                return pd.DataFrame()
+
 
     df_30min = pd.DataFrame()
-    # Sample 'roll' using the last value in each 30min interval
     df_30min['sampled_roll'] = df_1min_data['roll'].resample('30min').last()
-    # Also, bring over the 30-min close for context if needed later
-    df_30min['close'] = df_1min_data['close'].resample('30min').last()
-    df_30min.dropna(subset=['sampled_roll'], inplace=True) # Remove rows where sampled_roll is NaN (beginning of dataset)
+    df_30min['close'] = df_1min_data['close'].resample('30min').last() # Also bring over 30min close
+    df_30min.dropna(subset=['sampled_roll'], inplace=True)
 
+    if df_30min.empty:
+        print("[WARN] df_30min is empty after resampling and dropna in Z-score calculation.")
+        return pd.DataFrame({'volume_delta_zscore': []}) # Return empty DF with expected column
 
-    # Step 4: Calculate Momentum Histogram
     df_30min['fast_ema'] = df_30min['sampled_roll'].ewm(span=sig_len, adjust=False, min_periods=sig_len).mean()
     df_30min['slow_ema'] = df_30min['sampled_roll'].ewm(span=cmp_len, adjust=False, min_periods=cmp_len).mean()
     df_30min['hist'] = df_30min['fast_ema'] - df_30min['slow_ema']
 
-    # Step 5: Calculate Z-Score
-    df_30min['hist_mu'] = df_30min['hist'].rolling(window=z_len, min_periods=z_len // 2).mean() # Allow fewer periods at start
-    df_30min['hist_sigma'] = df_30min['hist'].rolling(window=z_len, min_periods=z_len // 2).std()
+    df_30min['hist_mu'] = df_30min['hist'].rolling(window=z_len, min_periods=max(1, z_len // 2)).mean()
+    df_30min['hist_sigma'] = df_30min['hist'].rolling(window=z_len, min_periods=max(1, z_len // 2)).std()
     
-    # Calculate Z-Score, ensuring sigma is not zero
-    df_30min['volume_delta_zscore'] = np.where(df_30min['hist_sigma'] == 0, 0, \
-                                        (df_30min['hist'] - df_30min['hist_mu']) / df_30min['hist_sigma'])
-    
-    # Clean up intermediate columns if you only want the Z-score and close
-    # For debugging, you might want to keep them.
-    # return df_30min[['close', 'volume_delta_zscore']]
+    df_30min['volume_delta_zscore'] = np.where(
+        df_30min['hist_sigma'].isnull() | (df_30min['hist_sigma'] == 0), 
+        0, 
+        (df_30min['hist'] - df_30min['hist_mu']) / df_30min['hist_sigma']
+    )
+    # Fill any remaining NaNs in z-score (e.g. if hist_mu was NaN) with 0
+    df_30min['volume_delta_zscore'].fillna(0, inplace=True)
+
     return df_30min # Return full df for now
 
 
