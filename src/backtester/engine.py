@@ -18,7 +18,14 @@ class BacktestEngine:
         self.initial_equity = initial_equity
         self.account_equity = initial_equity
         
-        self.current_trade_state = trade.create_new_trade_state_dict(None, None, None, None, None)
+        self.current_trade_state = trade.create_new_trade_state_dict(
+            entry_timestamp=None, 
+            direction=None, 
+            entry_price_at_band=None, 
+            actual_entry_price=None,    
+            vwap0_lagged=None, 
+            sigma0_lagged=None
+        )
         self.current_trade_state['active'] = False
         
         self.trade_history = []
