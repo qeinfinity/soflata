@@ -256,8 +256,8 @@ def update_trade_status_per_bar(current_trade, bar_data): # bar_data has current
     # Hits are checked against current bar's H/L
 
     # Target 1: Price reaches decision_vwap ± SCALE_OUT_1_SIGMA_TARGET * decision_sigma
-    target_1sigma_price = (decision_vwap - (SCALE_OUT_1_SIGMA_TARGET * decision_sigma) if direction == 'SHORT' 
-                           else decision_vwap + (SCALE_OUT_1_SIGMA_TARGET * decision_sigma))
+    target_1sigma_price = (decision_vwap + (SCALE_OUT_1_SIGMA_TARGET * decision_sigma) if direction == 'SHORT' 
+                           else decision_vwap - (SCALE_OUT_1_SIGMA_TARGET * decision_sigma))
     
     if not current_trade.get('scaled_out_t2_50_pct', False) and current_trade['t2_current_size'] > 1e-9:
         if (direction == 'SHORT' and bar_low <= target_1sigma_price) or \

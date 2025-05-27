@@ -32,22 +32,27 @@ class Trade:
 
     # Add more methods for managing state, P&L, etc.
 
-def create_new_trade_state_dict(entry_timestamp, direction, entry_price, vwap0, sigma0):
+def create_new_trade_state_dict(entry_timestamp, direction, 
+                                entry_price_at_band, # NEW: Price of the band that was hit
+                                actual_entry_price,    # NEW: Price after slippage
+                                vwap0_lagged, sigma0_lagged):
     return {
         'active': True,
         'entry_timestamp': entry_timestamp,
         'direction': direction,
-        'entry_price': entry_price,
-        'initial_vwap0': vwap0,
-        'initial_sigma0': sigma0,
+        'entry_price_at_band': entry_price_at_band, # Store the band price
+        'actual_entry_price': actual_entry_price,   # Store price after slippage (used for P&L)
+        'initial_vwap0': vwap0_lagged, # VWAP at start of entry bar (from t-1)
+        'initial_sigma0': sigma0_lagged, # Sigma at start of entry bar (from t-1)
         't1_entry_size': 0.0, 't1_current_size': 0.0, 't1_stop_price': 0.0, 't1_status': 'PENDING',
         't2_entry_size': 0.0, 't2_current_size': 0.0, 't2_stop_price': 0.0, 't2_status': 'PENDING',
         'bars_held': 0,
         'log': [],
         'pnl': 0.0,
-        'scaled_out_t2_50_pct': False, # Flag for PRD 3.4 scale-out logic
-        'scaled_out_t2_next_25_pct': False, # Flag for PRD 3.4 scale-out logic
-        'vwap_1sigma_target_hit_for_t1': False # Flag for PRD 3.3 invalidation logic
+        'initial_total_risk_dollars': 0.0, # Will be populated by BacktestEngine
+        'scaled_out_t2_50_pct': False,
+        'scaled_out_t2_next_25_pct': False,
+        'vwap_1sigma_target_hit_for_t1': False 
     }
 
 # Example: Simple trade dictionary structure
